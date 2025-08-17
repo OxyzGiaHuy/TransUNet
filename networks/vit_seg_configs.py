@@ -48,7 +48,7 @@ def get_r50_b16_config():
     config.resnet.width_factor = 1
 
     config.classifier = 'seg'
-    config.pretrained_path = '../model/vit_checkpoint/imagenet21k/R50+ViT-B_16.npz'
+    config.pretrained_path = './model/R50+ViT-B_16.npz'
     config.decoder_channels = (256, 128, 64, 16)
     config.skip_channels = [512, 256, 64, 16]
     config.n_classes = 2
@@ -98,7 +98,7 @@ def get_r50_l16_config():
     config.resnet.width_factor = 1
 
     config.classifier = 'seg'
-    config.resnet_pretrained_path = '../model/vit_checkpoint/imagenet21k/R50+ViT-B_16.npz'
+    config.resnet_pretrained_path = '/home/tanguyen12gb/Desktop/thaigiahuy/test_molex/TransUNet/model/R50+ViT-B_16.npz'
     config.decoder_channels = (256, 128, 64, 16)
     config.skip_channels = [512, 256, 64, 16]
     config.n_classes = 2
@@ -128,3 +128,33 @@ def get_h14_config():
     config.representation_size = None
 
     return config
+
+
+def get_molex_r50_b16_config():
+    """Returns the MoLEx R50+ViT-B/16 configuration."""
+    config = get_r50_b16_config()
+    
+    # MoLEx specific configurations
+    config.molex = ml_collections.ConfigDict()
+    config.molex.expert_dropout = 0.1
+    config.molex.alpha = 0.5
+    config.molex.router_hidden_dim = 256
+    config.molex.bias_strength = 2.0
+    config.molex.use_residual = True
+    config.molex.load_balance_weight = 0.01
+    
+    return config
+
+
+# CONFIGS dictionary để dễ dàng access
+CONFIGS = {
+    'ViT-B_16': get_b16_config,
+    'ViT-B_32': get_b32_config,
+    'ViT-L_16': get_l16_config,
+    'ViT-L_32': get_l32_config,
+    'ViT-H_14': get_h14_config,
+    'R50-ViT-B_16': get_r50_b16_config,
+    'R50-ViT-L_16': get_r50_l16_config,
+    'testing': get_testing,
+    'MoLEx-R50-ViT-B_16': get_molex_r50_b16_config,
+}

@@ -15,9 +15,8 @@ import numpy as np
 
 from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNorm
 from torch.nn.modules.utils import _pair
-from scipy import ndimage
-from . import vit_seg_configs as configs
-from .vit_seg_modeling_resnet_skip import ResNetV2
+import vit_seg_configs as configs
+from vit_seg_modeling_resnet_skip import ResNetV2
 
 
 logger = logging.getLogger(__name__)
@@ -37,14 +36,18 @@ def np2th(weights, conv=False):
     """Possibly convert HWIO to OIHW."""
     if conv:
         weights = weights.transpose([3, 2, 0, 1])
-    return torch.from_numpy(weights)
+    # Convert to torch tensor directly
+    return torch.tensor(weights, dtype=torch.float32)
 
 
 def swish(x):
     return x * torch.sigmoid(x)
 
 
-ACT2FN = {"gelu": torch.nn.functional.gelu, "relu": torch.nn.functional.relu, "swish": swish}
+ACT2FN = {
+    "gelu": torch.nn.functional.gelu, 
+    "relu": torch.nn.functional.relu, 
+    "swish": swish}
 
 
 class Attention(nn.Module):
@@ -418,7 +421,14 @@ class VisionTransformer(nn.Module):
                 print('load_pretrained: grid-size from %s to %s' % (gs_old, gs_new))
                 posemb_grid = posemb_grid.reshape(gs_old, gs_old, -1)
                 zoom = (gs_new / gs_old, gs_new / gs_old, 1)
-                posemb_grid = ndimage.zoom(posemb_grid, zoom, order=1)  # th2np
+                if ndimage is not None:
+                    posemb_grid = ndimage.zoom(posemb_grid, zoom, order=1)  # th2np
+                else:
+                    # Alternative resize using PyTorch interpolation
+                    import torch.nn.functional as F
+                    posemb_grid = torch.from_numpy(posemb_grid).permute(2, 0, 1).unsqueeze(0)
+                    posemb_grid = F.interpolate(posemb_grid, size=(gs_new, gs_new), mode='bilinear', align_corners=False)
+                    posemb_grid = posemb_grid.squeeze(0).permute(1, 2, 0).numpy()
                 posemb_grid = posemb_grid.reshape(1, gs_new * gs_new, -1)
                 posemb = posemb_grid
                 self.transformer.embeddings.position_embeddings.copy_(np2th(posemb))
@@ -449,5 +459,3 @@ CONFIGS = {
     'R50-ViT-L_16': configs.get_r50_l16_config(),
     'testing': configs.get_testing(),
 }
-
-
