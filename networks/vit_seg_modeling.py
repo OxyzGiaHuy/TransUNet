@@ -9,14 +9,15 @@ import math
 
 from os.path import join as pjoin
 
+from scipy import ndimage
 import torch
 import torch.nn as nn
 import numpy as np
 
 from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNorm
 from torch.nn.modules.utils import _pair
-import vit_seg_configs as configs
-from vit_seg_modeling_resnet_skip import ResNetV2
+import networks.vit_seg_configs as configs
+from networks.vit_seg_modeling_resnet_skip import ResNetV2
 
 
 logger = logging.getLogger(__name__)
@@ -43,11 +44,17 @@ def np2th(weights, conv=False):
 def swish(x):
     return x * torch.sigmoid(x)
 
+def swiglu(x):
+    # x có shape [batch, 2*hidden_dim]
+    x, gate = x.chunk(2, dim=-1)   # tách đôi theo chiều cuối
+    return x * swish(gate)
 
 ACT2FN = {
     "gelu": torch.nn.functional.gelu, 
     "relu": torch.nn.functional.relu, 
-    "swish": swish}
+    "swish": swish,
+    "swiglu": swiglu
+}
 
 
 class Attention(nn.Module):
@@ -100,9 +107,17 @@ class Attention(nn.Module):
 class Mlp(nn.Module):
     def __init__(self, config):
         super(Mlp, self).__init__()
-        self.fc1 = Linear(config.hidden_size, config.transformer["mlp_dim"])
-        self.fc2 = Linear(config.transformer["mlp_dim"], config.hidden_size)
-        self.act_fn = ACT2FN["gelu"]
+        activation = "gelu"
+        self.act_fn = ACT2FN[activation]
+
+        # nếu dùng swiglu thì fc1 phải x2
+        if activation == "swiglu":
+            hidden_dim = 2 * config.transformer["mlp_dim"]
+        else:
+            hidden_dim = config.transformer["mlp_dim"]
+
+        self.fc1 = nn.Linear(config.hidden_size, hidden_dim)
+        self.fc2 = nn.Linear(config.transformer["mlp_dim"], config.hidden_size)
         self.dropout = Dropout(config.transformer["dropout_rate"])
 
         self._init_weights()
