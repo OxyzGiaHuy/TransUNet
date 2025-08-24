@@ -29,7 +29,7 @@ sys.path.append('/home/tanguyen12gb/Desktop/thaigiahuy/test_molex/TransUNet')
 
 from datasets.dataset_wbc import WBC_dataset, RandomGenerator
 from networks.vit_seg_modeling_molexunet import create_molex_unet, get_molex_config
-from simple_utils import SimpleDiceLoss
+from utils import SimpleDiceLoss
 
 
 def visualize_predictions_and_experts(model, dataloader, device, output_dir, epoch, num_samples=3):
@@ -92,7 +92,7 @@ def visualize_predictions_and_experts(model, dataloader, device, output_dir, epo
             # Row 1: Segmentation results
             # Original image
             axes[0, 0].imshow(img_np, cmap='gray')
-            axes[0, 0].set_title(f'Input Image\\n{case_name}')
+            axes[0, 0].set_title(f'Input Image\n{case_name}')
             axes[0, 0].axis('off')
             
             # Ground truth
@@ -137,8 +137,8 @@ def visualize_predictions_and_experts(model, dataloader, device, output_dir, epo
             for block_type in ['cnn_blocks', 'transformer_blocks']:
                 for block_stat in expert_stats[block_type]:
                     stats = block_stat['stats']
-                    if 'current_alpha' in stats:
-                        alpha_values.append(stats['current_alpha'])
+                    if 'learned_alpha' in stats:
+                        alpha_values.append(stats['learned_alpha'])
             
             if alpha_values:
                 axes[1, 2].bar(range(len(alpha_values)), alpha_values)
@@ -330,7 +330,16 @@ def train_wbc_molexunet():
     """Training function for MoLEx-UNet on WBC dataset"""
     print("Starting MoLEx-UNet training on WBC dataset...")
     
-    # Configuration
+    # Clear GPU memory and set memory management
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        # Set CUDA memory fraction to prevent OOM
+        torch.cuda.set_per_process_memory_fraction(0.9)
+        print(f"GPU Memory Available: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+        print(f"GPU Memory Allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+        print(f"GPU Memory Reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+    
+    # Configuration - Reduced memory usage
     args = {
         'dataset': 'WBC',
         'model_name': 'MoLEx-UNet',
@@ -372,8 +381,8 @@ def train_wbc_molexunet():
         db_train, 
         batch_size=args['batch_size'], 
         shuffle=True, 
-        num_workers=2, 
-        pin_memory=True
+        num_workers=1,  
+        pin_memory=False  # Disabled to save memory
     )
     
     # Create MoLEx-UNet model
@@ -389,8 +398,7 @@ def train_wbc_molexunet():
             'expert_dropout': 0.1,
             'alpha': 0.7,
             'router_hidden_dim': 256,
-            'bias_strength': 2.0,
-            'use_residual': True
+            'bias_strength': 2.0
         }
     
     config.n_classes = args['num_classes']
@@ -407,6 +415,11 @@ def train_wbc_molexunet():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
     net = net.to(device)
+    
+    # Clear GPU cache before training
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        logging.info("GPU cache cleared before training")
     
     # Loss functions and optimizer
     ce_loss = nn.CrossEntropyLoss()
@@ -483,8 +496,9 @@ def train_wbc_molexunet():
                     logging.info(f'  LR: {lr_:.6f}')
                     
                     # Expert usage summary
-                    total_cnn_calls = sum([len(block['stats'].get('expert_usage', [])) for block in expert_stats.get('cnn_blocks', [])])
-                    total_transformer_calls = sum([len(block['stats'].get('expert_usage', [])) for block in expert_stats.get('transformer_blocks', [])])
+                    expert_stats = net.get_expert_usage_statistics()
+                    total_cnn_calls = sum([block['stats'].get('expert_successes', 0) for block in expert_stats.get('cnn_blocks', [])])
+                    total_transformer_calls = sum([block['stats'].get('expert_successes', 0) for block in expert_stats.get('transformer_blocks', [])])
                     logging.info(f'  Expert Calls: CNN={total_cnn_calls}, Transformer={total_transformer_calls}')
         
         # Calculate epoch-end metrics on full dataset
@@ -551,7 +565,9 @@ def train_wbc_molexunet():
         # Generate visualizations every 5 epochs
         if (epoch + 1) % 5 == 0:
             logging.info("Generating prediction and expert analysis visualizations...")
-            visualize_predictions_and_experts(net, trainloader, device, output_dir, epoch + 1, num_samples=3)
+            torch.cuda.empty_cache()  # Clear cache before visualization
+            visualize_predictions_and_experts(net, trainloader, device, output_dir, epoch + 1, num_samples=2)  # Reduced samples
+            torch.cuda.empty_cache()  # Clear cache after visualization
     
     # Final model save
     final_model_path = os.path.join(output_dir, 'final_model.pth')
@@ -563,13 +579,16 @@ def train_wbc_molexunet():
     logging.info("=== FINAL EXPERT USAGE STATISTICS ===")
     logging.info(f"Expert Pool Size: {len(net.hybrid_encoder.expert_pool)}")
     for block_type in ['cnn_blocks', 'transformer_blocks']:
-        logging.info(f"\\n{block_type.upper()}:")
+        logging.info(f"\n{block_type.upper()}:")
         for block_stat in final_stats[block_type]:
             block_idx = block_stat['block_index']
             stats = block_stat['stats']
+            # Get router stats for total calls
+            router_stats = stats.get('router_stats', {})
             logging.info(f"  Block {block_idx}: Success Rate: {stats.get('success_rate', 0):.3f}, "
-                        f"Alpha: {stats.get('current_alpha', 0):.3f}, "
-                        f"Total Calls: {stats.get('total_calls', 0)}")
+                        f"Alpha: {stats.get('learned_alpha', 0):.3f}, "
+                        f"Total Calls: {router_stats.get('total_calls', 0)}, "
+                        f"Forward Calls: {stats.get('forward_calls', 0)}")
     
     logging.info("MoLEx-UNet training completed successfully!")
     

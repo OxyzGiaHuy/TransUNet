@@ -1,20 +1,21 @@
-import numpy as np
 import torch
-from medpy import metric
-from scipy.ndimage import zoom
 import torch.nn as nn
-import SimpleITK as sitk
+import torch.nn.functional as F
+import numpy as np
+import os
+import logging
 
-
-class DiceLoss(nn.Module):
-    def __init__(self, n_classes):
-        super(DiceLoss, self).__init__()
+class SimpleDiceLoss(nn.Module):
+    """Simple Dice Loss implementation without external dependencies"""
+    def __init__(self, n_classes, softmax=True):
+        super(SimpleDiceLoss, self).__init__()
         self.n_classes = n_classes
+        self.softmax = softmax
 
     def _one_hot_encoder(self, input_tensor):
         tensor_list = []
         for i in range(self.n_classes):
-            temp_prob = input_tensor == i  # * torch.ones_like(input_tensor)
+            temp_prob = input_tensor == i
             tensor_list.append(temp_prob.unsqueeze(1))
         output_tensor = torch.cat(tensor_list, dim=1)
         return output_tensor.float()
@@ -31,7 +32,7 @@ class DiceLoss(nn.Module):
 
     def forward(self, inputs, target, weight=None, softmax=False):
         if softmax:
-            inputs = torch.softmax(inputs, dim=1)
+            inputs = F.softmax(inputs, dim=1)
         target = self._one_hot_encoder(target)
         if weight is None:
             weight = [1] * self.n_classes
@@ -44,59 +45,149 @@ class DiceLoss(nn.Module):
             loss += dice * weight[i]
         return loss / self.n_classes
 
+class CombinedLoss(nn.Module):
+    """Combined Cross Entropy and Dice Loss"""
+    def __init__(self, alpha=0.5, n_classes=2):
+        super(CombinedLoss, self).__init__()
+        self.alpha = alpha
+        self.ce = nn.CrossEntropyLoss()
+        self.dice = SimpleDiceLoss(n_classes)
 
-def calculate_metric_percase(pred, gt):
-    pred[pred > 0] = 1
-    gt[gt > 0] = 1
-    if pred.sum() > 0 and gt.sum()>0:
-        dice = metric.binary.dc(pred, gt)
-        hd95 = metric.binary.hd95(pred, gt)
-        return dice, hd95
-    elif pred.sum() > 0 and gt.sum()==0:
-        return 1, 0
-    else:
-        return 0, 0
+    def forward(self, pred, target):
+        ce_loss = self.ce(pred, target)
+        dice_loss = self.dice(pred, target)
+        return self.alpha * ce_loss + (1 - self.alpha) * dice_loss
 
+def calculate_pixel_accuracy(pred_tensor, target_tensor):
+    """Calculate pixel-wise accuracy using torch operations"""
+    pred_flat = pred_tensor.flatten()
+    target_flat = target_tensor.flatten()
+    correct = torch.sum(pred_flat == target_flat).item()
+    total = target_flat.numel()
+    return correct / total
 
-def test_single_volume(image, label, net, classes, patch_size=[256, 256], test_save_path=None, case=None, z_spacing=1):
-    image, label = image.squeeze(0).cpu().detach().numpy(), label.squeeze(0).cpu().detach().numpy()
-    if len(image.shape) == 3:
-        prediction = np.zeros_like(label)
-        for ind in range(image.shape[0]):
-            slice = image[ind, :, :]
-            x, y = slice.shape[0], slice.shape[1]
-            if x != patch_size[0] or y != patch_size[1]:
-                slice = zoom(slice, (patch_size[0] / x, patch_size[1] / y), order=3)  # previous using 0
-            input = torch.from_numpy(slice).unsqueeze(0).unsqueeze(0).float().cuda()
-            net.eval()
-            with torch.no_grad():
-                outputs = net(input)
-                out = torch.argmax(torch.softmax(outputs, dim=1), dim=1).squeeze(0)
-                out = out.cpu().detach().numpy()
-                if x != patch_size[0] or y != patch_size[1]:
-                    pred = zoom(out, (x / patch_size[0], y / patch_size[1]), order=0)
-                else:
-                    pred = out
-                prediction[ind] = pred
-    else:
-        input = torch.from_numpy(image).unsqueeze(
-            0).unsqueeze(0).float().cuda()
-        net.eval()
-        with torch.no_grad():
-            out = torch.argmax(torch.softmax(net(input), dim=1), dim=1).squeeze(0)
-            prediction = out.cpu().detach().numpy()
-    metric_list = []
-    for i in range(1, classes):
-        metric_list.append(calculate_metric_percase(prediction == i, label == i))
+def calculate_iou(pred_tensor, target_tensor, num_classes):
+    """Calculate IoU for each class and mean IoU using torch operations"""
+    pred_flat = pred_tensor.flatten()
+    target_flat = target_tensor.flatten()
+    ious = []
+    for cls in range(num_classes):
+        pred_cls = (pred_flat == cls)
+        target_cls = (target_flat == cls)
+        intersection = torch.sum(pred_cls & target_cls).item()
+        union = torch.sum(pred_cls | target_cls).item()
+        if union == 0:
+            iou = 1.0
+        else:
+            iou = intersection / union
+        ious.append(iou)
+    return ious, sum(ious) / len(ious)
 
-    if test_save_path is not None:
-        img_itk = sitk.GetImageFromArray(image.astype(np.float32))
-        prd_itk = sitk.GetImageFromArray(prediction.astype(np.float32))
-        lab_itk = sitk.GetImageFromArray(label.astype(np.float32))
-        img_itk.SetSpacing((1, 1, z_spacing))
-        prd_itk.SetSpacing((1, 1, z_spacing))
-        lab_itk.SetSpacing((1, 1, z_spacing))
-        sitk.WriteImage(prd_itk, test_save_path + '/'+case + "_pred.nii.gz")
-        sitk.WriteImage(img_itk, test_save_path + '/'+ case + "_img.nii.gz")
-        sitk.WriteImage(lab_itk, test_save_path + '/'+ case + "_gt.nii.gz")
-    return metric_list
+def calculate_dice_coefficient(pred_tensor, target_tensor, num_classes):
+    """Calculate Dice coefficient for each class using torch operations"""
+    pred_flat = pred_tensor.flatten()
+    target_flat = target_tensor.flatten()
+    dice_scores = []
+    for cls in range(num_classes):
+        pred_cls = (pred_flat == cls)
+        target_cls = (target_flat == cls)
+        intersection = torch.sum(pred_cls & target_cls).item()
+        total = torch.sum(pred_cls).item() + torch.sum(target_cls).item()
+        if total == 0:
+            dice = 1.0
+        else:
+            dice = (2 * intersection) / total
+        dice_scores.append(dice)
+    return dice_scores, sum(dice_scores) / len(dice_scores)
+
+def visualize_predictions(model, dataloader, device, output_dir, epoch, num_samples=5):
+    """Visualize model predictions and save them"""
+    model.eval()
+    os.makedirs(os.path.join(output_dir, 'visualizations'), exist_ok=True)
+    
+    # Color map for 2 classes (binary segmentation)
+    colors = {
+        0: [0, 0, 0],       # Background - Black
+        1: [255, 255, 255]  # Nuclei - White
+    }
+    
+    def colorize(mask):
+        color_mask = np.zeros((*mask.shape, 3), dtype=np.uint8)
+        for class_id, color in colors.items():
+            color_mask[mask == class_id] = color
+        return color_mask
+
+    def overlay_mask_on_image(image, mask, color, alpha=0.4):
+        """
+        Overlay a single-channel mask on an RGB image.
+        image: HxWx3, float [0,1]
+        mask: HxW, int (0 or 1)
+        color: (R,G,B) 0-255
+        alpha: transparency
+        """
+        overlay = image.copy()
+        mask_bool = mask.astype(bool)
+        overlay[mask_bool] = (1 - alpha) * overlay[mask_bool] + alpha * (np.array(color) / 255.0)
+        return overlay
+
+    with torch.no_grad():
+        for i, sample in enumerate(dataloader):
+            if i >= num_samples:
+                break
+                
+            images = sample['image'].to(device)
+            masks = sample['label'].to(device)
+
+            # Get predictions
+            logits = model(images)
+            predictions = torch.argmax(logits, dim=1)
+
+            # Convert to numpy for visualization
+            images_np = images.cpu().numpy()
+            masks_np = masks.cpu().numpy()
+            predictions_np = predictions.cpu().numpy()
+
+            # Create visualization
+            batch_size = images.shape[0]
+            fig, axes = plt.subplots(batch_size, 4, figsize=(20, 5*batch_size))
+
+            if batch_size == 1:
+                axes = axes.reshape(1, -1)
+
+            for j in range(batch_size):
+                # Original image (denormalize)
+                img = images_np[j].transpose(1, 2, 0)
+                img = img * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
+                img = np.clip(img, 0, 1)
+
+                # Ground truth and predicted masks
+                gt_mask = colorize(masks_np[j])
+                pred_mask = colorize(predictions_np[j])
+
+                # Overlay GT and prediction on image
+                overlay_gt = overlay_mask_on_image(img, masks_np[j], color=[0,255,0], alpha=0.4)  # GT: green
+                overlay_pred = overlay_mask_on_image(overlay_gt, predictions_np[j], color=[255,0,0], alpha=0.4)  # Pred: red
+
+                # Plot
+                axes[j, 0].imshow(img)
+                axes[j, 0].set_title('Original Image')
+                axes[j, 0].axis('off')
+
+                axes[j, 1].imshow(gt_mask)
+                axes[j, 1].set_title('Ground Truth')
+                axes[j, 1].axis('off')
+
+                axes[j, 2].imshow(pred_mask)
+                axes[j, 2].set_title('Predicted Mask')
+                axes[j, 2].axis('off')
+
+                axes[j, 3].imshow(overlay_pred)
+                axes[j, 3].set_title('Overlay (GT: green, Pred: red)')
+                axes[j, 3].axis('off')
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, 'visualizations', f'epoch_{epoch}_batch_{i}.png'))
+            plt.close()
+    
+    model.train()
+    logging.info(f'Saved {min(num_samples, len(dataloader))} visualization samples to {output_dir}/visualizations/')
